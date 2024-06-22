@@ -10,24 +10,38 @@ import (
 	"net"
 	"os"
 	"strconv"
-	"strings"
 )
 
-type t byte
+type mtype byte // message type
 
-// TODO ensure matches doc
 const (
-	exitt  = t(0b000)
-	entert = t(0b001)
-	recvt  = t(0b010)
-	sendt  = t(0b011)
-	errt   = t(0b11111111)
+	// types of outgoing messages
+	mExit  = mtype(0b000)
+	mEnter = mtype(0b001)
+	mSend  = mtype(0b011)
+
+	// types of incoming messages
+	mRecv = mtype(0b010)
+	mSig  = mtype(0xFF)
 )
 
-type message struct {
-	t t      // type
-	p uint32 // port
-	b string // body
+type sig byte
+
+const (
+	sOkEnter = sig(0x01)
+	sOkExit  = sig(0x02)
+	sOkSend  = sig(0x03)
+	sErrType = sig(0x80)
+)
+
+type mes struct {
+	p uint32
+	b []byte
+}
+
+type tmes struct {
+	t mtype // type
+	mes
 }
 
 func client() {
@@ -37,50 +51,59 @@ func client() {
 	}
 	defer conn.Close()
 
-	outgoing := make(chan message)
+	outgoing := make(chan tmes)
+
+	mchan := make(chan mes) // incoming recv
+	schan := make(chan sig) // incoming sig
+
 	defer close(outgoing)
 
-	messages := make(chan message)
+	go servWriter(conn, outgoing)     // transforms messages from outgoing into writes to conn
+	go servReader(conn, mchan, schan) // reads from conn and sends to mchan and schan
 
-	go writer(conn, outgoing)
-	go reader(conn, messages)
-
+	// consume mchan, schan
 	go func() {
-		for m := range messages {
-			switch m.t {
-			case recvt:
+		for {
+			select {
+			case m, ok := <-mchan:
+				if !ok {
+					break
+				}
 				fmt.Printf("< %d ? %s\n", m.p, m.b)
-			case errt:
-				fmt.Printf("ERR %s\n", m.b)
+			case s, ok := <-schan:
+				if !ok {
+					break
+				}
+				fmt.Printf("< SIG %x\n", s)
 			}
 		}
 	}()
 
+	// TODO we keep scanning even after the connection has closed
+
+	// produce outgoing
 	s := bufio.NewScanner(os.Stdin)
 loop:
-	for {
-		fmt.Print("> ")
-		if !s.Scan() {
-			break
-		}
-		cmd := s.Text()
+	for s.Scan() {
+		cmd := s.Bytes()
 		if len(cmd) == 0 {
 			fmt.Println("invalid command")
 			continue
 		}
-		if strings.HasSuffix(cmd, "XXX") {
+		if bytes.HasSuffix(cmd, []byte{'X', 'X', 'X'}) {
 			fmt.Println("command cancelled")
 			continue
 		}
+
 		var port uint32
-		var body string
+		var body []byte
 		switch {
 		case send(cmd, &port, &body):
-			outgoing <- message{sendt, port, body}
+			outgoing <- tmes{mSend, mes{port, body}}
 		case enter(cmd, &port):
-			outgoing <- message{entert, port, ""}
+			outgoing <- tmes{mEnter, mes{port, []byte{}}}
 		case exit(cmd, &port):
-			outgoing <- message{exitt, port, ""}
+			outgoing <- tmes{mExit, mes{port, []byte{}}}
 		case quit(cmd):
 			fmt.Println("quitting. goodbye!")
 			break loop
@@ -97,19 +120,19 @@ func main() {
 	client()
 }
 
-func send(cmd string, portp *uint32, messagep *string) bool {
-	ports, cmd, ok := strings.Cut(cmd, " ")
+func send(cmd []byte, portp *uint32, messagep *[]byte) bool {
+	portb, cmd, ok := bytes.Cut(cmd, []byte{' '})
 	if !ok {
 		return false
 	}
-	bang, cmd, ok := strings.Cut(cmd, " ")
+	bang, cmd, ok := bytes.Cut(cmd, []byte{' '})
 	if !ok {
 		return false
 	}
-	if bang != "!" {
+	if bang[0] != '!' {
 		return false
 	}
-	port, err := strconv.ParseUint(ports, 10, 32)
+	port, err := strconv.ParseUint(string(portb), 10, 32)
 	if err != nil {
 		return false
 	}
@@ -118,15 +141,15 @@ func send(cmd string, portp *uint32, messagep *string) bool {
 	return true
 }
 
-func enter(cmd string, portp *uint32) bool {
-	bang, ports, ok := strings.Cut(cmd, " ")
+func enter(cmd []byte, portp *uint32) bool {
+	bang, portb, ok := bytes.Cut(cmd, []byte{' '})
 	if !ok {
 		return false
 	}
-	if bang != "!" {
+	if bang[0] != '!' {
 		return false
 	}
-	port, err := strconv.ParseUint(ports, 10, 32)
+	port, err := strconv.ParseUint(string(portb), 10, 32)
 	if err != nil {
 		return false
 	}
@@ -134,15 +157,15 @@ func enter(cmd string, portp *uint32) bool {
 	return true
 }
 
-func exit(cmd string, portp *uint32) bool {
-	dot, ports, ok := strings.Cut(cmd, " ")
+func exit(cmd []byte, portp *uint32) bool {
+	dot, portb, ok := bytes.Cut(cmd, []byte{' '})
 	if !ok {
 		return false
 	}
-	if dot != "." {
+	if dot[0] != '.' {
 		return false
 	}
-	port, err := strconv.ParseUint(ports, 10, 32)
+	port, err := strconv.ParseUint(string(portb), 10, 32)
 	if err != nil {
 		return false
 	}
@@ -150,22 +173,28 @@ func exit(cmd string, portp *uint32) bool {
 	return true
 }
 
-func quit(cmd string) bool {
-	return cmd == "q"
+func quit(cmd []byte) bool {
+	return cmd[0] == 'q' && len(cmd) == 1
 }
 
-func writer(w io.Writer, outgoing <-chan message) {
-	for c := range outgoing {
-		if _, err := w.Write([]byte{byte(c.t)}); err != nil {
+func servWriter(w io.Writer, outgoing <-chan tmes) {
+	for m := range outgoing {
+		var head [5]byte
+		head[0] = byte(m.t)
+		binary.LittleEndian.PutUint32(head[1:], m.p)
+		if _, err := w.Write(head[:]); err != nil {
 			log.Println(err)
 			break
 		}
-		if err := binary.Write(w, binary.LittleEndian, c.p); err != nil {
-			log.Println(err)
-			break
-		}
-		if c.t == sendt {
-			if _, err := io.WriteString(w, c.b); err != nil {
+
+		if m.t == mSend {
+			var siz [2]byte
+			binary.LittleEndian.PutUint16(siz[:], uint16(len(m.b)))
+			if _, err := w.Write(siz[:]); err != nil {
+				log.Println(err)
+				break
+			}
+			if _, err := w.Write(m.b); err != nil {
 				log.Println(err)
 				break
 			}
@@ -177,41 +206,64 @@ func writer(w io.Writer, outgoing <-chan message) {
 	}
 }
 
-// TODO redo according to server
-func reader(r io.Reader, messages chan<- message) {
-	defer close(messages)
-	var buf [256]byte
-
-	// TODO handle messages that span more than 1 r.Read()
-
-	// maybe model as state machine
+func servReader(r io.Reader, mc chan<- mes, sc chan<- sig) {
+	defer close(mc)
+	defer close(sc)
 
 	for {
-		n, err := r.Read(buf[:])
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			fmt.Println(err)
-			break
-		}
-		bs := buf[:n]
-		t, bs := t(bs[0]), bs[1:]
-
-		switch t {
-		case recvt:
-			var port uint32
-			br := bytes.NewReader(bs[1:4]) // hopefully a non-power-of-two number of bytes isn't a problem
-			if err := binary.Read(br, binary.LittleEndian, &port); err != nil {
-				log.Println(err)
-				continue
+		var buf [1]byte
+		if err := readFull(r, buf[:]); err != nil {
+			if err != io.EOF {
+				log.Printf("read t: %v", err)
 			}
-			messages <- message{recvt, port, string(bs[4:])}
-		case errt:
-			// for now just return the error code as a string
-			messages <- message{errt, 0, strconv.Itoa(int(bs[1]))}
-		default:
-			log.Printf("weird message type %b\n", t)
+			break
+		}
+		t := mtype(buf[0])
+
+		if t == mSig {
+			if err := readFull(r, buf[:]); err != nil {
+				if err != io.EOF {
+					log.Printf("read sig: %v", err)
+				}
+				break
+			}
+			sc <- sig(buf[0])
+		} else {
+			var portbuf [4]byte
+			if err := readFull(r, portbuf[:]); err != nil {
+				if err != io.EOF {
+					log.Printf("read port: %v", err)
+				}
+				break
+			}
+			port := binary.LittleEndian.Uint32(portbuf[:])
+
+			var sizbuf [2]byte
+			if err := readFull(r, sizbuf[:]); err != nil {
+				if err != io.EOF {
+					log.Printf("read size: %v", err)
+				}
+				break
+			}
+			siz := binary.LittleEndian.Uint16(sizbuf[:])
+
+			bb := new(bytes.Buffer)
+			io.Copy(bb, io.LimitReader(r, int64(siz)))
+			body := bb.Bytes()
+
+			mc <- mes{port, body}
 		}
 	}
+}
+
+func readFull(r io.Reader, buf []byte) error {
+	rem := buf
+	for len(rem) > 0 {
+		n, err := r.Read(rem)
+		if err != nil {
+			return err
+		}
+		rem = rem[n:]
+	}
+	return nil
 }

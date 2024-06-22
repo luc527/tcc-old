@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"io"
 	"log"
-	"log/slog"
 	"net"
 )
 
@@ -46,11 +45,6 @@ const (
 	sErrType = sig(0x80)
 )
 
-// TODO instead of an error type
-// let's include a signal type
-// which includes errors (when the signal has a 1 in the most significant bit)
-// and things like.. entered successfully, exited successfully, sent successfully
-
 func serve() {
 	listener, err := net.Listen("tcp", "localhost:1703")
 	if err != nil {
@@ -61,7 +55,7 @@ func serve() {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Printf("connection error: %v\n", err)
+			log.Printf("connection error: %v", err)
 		} else {
 			go handle(conn)
 		}
@@ -74,11 +68,8 @@ func handle(conn io.ReadWriteCloser) {
 	mc := make(chan mes) // channel for outgoing messages
 	sc := make(chan sig) // channel for outgoing signals
 
-	defer close(mc)
-	defer close(sc)
-
-	go cliWriter(conn, mc, sc)
-	cliReader(conn, mc, sc)
+	go cliWriter(conn, mc, sc) // read from the channels and write to the conn
+	cliReader(conn, mc, sc)    // read from the conn and write to the channels (now or later when a message from another user is broadcasted)
 }
 
 func readFull(r io.Reader, buf []byte) error {
@@ -94,37 +85,24 @@ func readFull(r io.Reader, buf []byte) error {
 }
 
 func cliReader(r io.Reader, mc chan<- mes, sc chan<- sig) {
-	// TODO the "main" connection goroutine reads from the client
-	// but I should start a goroutine for sending messages back instead of doing it in the same goroutine
-	// and pass the channel for the internal handlers to send to
-	// except handleSend which will also take the conn as an io.Reader to read the body
-	// -- but then caution
-	// with two goroutines whould detect closing from both sides
-	// without leaking goroutines and without deadlocks
+	defer close(mc)
+	defer close(sc)
 
 	for {
-		var tbuf [1]byte
-		if err := readFull(r, tbuf[:]); err != nil {
+		var headbuf [5]byte
+		if err := readFull(r, headbuf[:]); err != nil {
 			if err != io.EOF {
-				slog.Error("handle: read type", "error", err)
+				log.Printf("handle read head: %v", err)
 			}
 			break
 		}
-		t := mtype(tbuf[0])
-
-		var portbuf [4]byte
-		if err := readFull(r, portbuf[:]); err != nil {
-			if err != io.EOF {
-				slog.Error("handle: read port", "error", err)
-			}
-
-		}
-		port := binary.LittleEndian.Uint32(portbuf[:])
+		t := mtype(headbuf[0])
+		port := binary.LittleEndian.Uint32(headbuf[1:])
 
 		if t == mEnter {
-			handleEnter(port, sc)
+			handleEnter(port, mc, sc)
 		} else if t == mExit {
-			handleExit(port, sc)
+			handleExit(port, mc, sc)
 		} else if t == mSend {
 			// the reader might EOF in this call
 			// but we'll leave it for the next iteration of the loop to detect that
@@ -137,6 +115,7 @@ func cliReader(r io.Reader, mc chan<- mes, sc chan<- sig) {
 
 func cliWriter(w io.Writer, mc <-chan mes, sc <-chan sig) {
 	// TODO how to deal correctly with errors on writing?
+	// should break? then should also drain mc and sc, maybe
 
 	for {
 		select {
@@ -144,13 +123,12 @@ func cliWriter(w io.Writer, mc <-chan mes, sc <-chan sig) {
 			if !ok {
 				break
 			}
-			t := [1]byte{byte(mRecv)}
-			port := [4]byte{}
-			binary.LittleEndian.PutUint32(port[:], m.p)
-			if _, err := w.Write(t[:]); err != nil {
-				log.Printf("cli writer message type: %v", err)
-			} else if _, err := w.Write(port[:]); err != nil {
-				log.Printf("cli writer message port: %v", err)
+
+			head := [5]byte{byte(mRecv)}
+			binary.LittleEndian.PutUint32(head[1:], m.p)
+
+			if _, err := w.Write(head[:]); err != nil {
+				log.Printf("cli writer message head: %v", err)
 			} else if _, err := w.Write(m.b); err != nil {
 				log.Printf("cli writer message body: %v", err)
 			}
@@ -169,14 +147,16 @@ func cliWriter(w io.Writer, mc <-chan mes, sc <-chan sig) {
 	}
 }
 
-func handleEnter(port uint32, sc chan<- sig) {
-	log.Printf("enter %d\n", port)
+func handleEnter(port uint32, mc chan<- mes, sc chan<- sig) {
+	log.Printf("enter %d", port)
 	sc <- sOkEnter
+	_ = mc
 }
 
-func handleExit(port uint32, sc chan<- sig) {
-	log.Printf("exit %d\n", port)
+func handleExit(port uint32, mc chan<- mes, sc chan<- sig) {
+	log.Printf("exit %d", port)
 	sc <- sOkExit
+	_ = mc
 }
 
 func readBody(r io.Reader) ([]byte, error) {
@@ -200,12 +180,12 @@ func handleSend(port uint32, sc chan<- sig, r io.Reader) {
 		}
 		return
 	}
-	log.Printf("send %q to %d\n", string(bs), port)
+	log.Printf("send %q to %d", string(bs), port)
 	sc <- sOkSend
 }
 
 func handleInvalidType(sc chan<- sig) {
-	log.Printf("invalid\n")
+	log.Printf("invalid")
 	sc <- sErrType
 }
 
