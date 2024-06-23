@@ -85,7 +85,7 @@ func client() {
 	s := bufio.NewScanner(os.Stdin)
 loop:
 	for s.Scan() {
-		cmd := s.Bytes()
+		cmd := bytes.Trim(s.Bytes(), " \n\r\t")
 		if len(cmd) == 0 {
 			fmt.Println("invalid command")
 			continue
