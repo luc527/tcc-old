@@ -101,7 +101,7 @@ func (p port) broadcast(m mes) {
 	// Problema: o tamanho de um buffered channel é fixo.
 	// para alguns clientes pode ser muito (estão em poucos ports
 	// e/ou ports com pouco movimento), enquanto para alguns clientes
-	// pode ser muito (estão em muitos ports e/ou ports com muito movimento).
+	// pode ser pouco (estão em muitos ports e/ou ports com muito movimento).
 	//
 	// 4. Envio síncrono a uma "mailbox"
 	// Em vez da goroutine cliente ser a mesma que escreve no seu socket,
