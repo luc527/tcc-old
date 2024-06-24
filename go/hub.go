@@ -62,6 +62,7 @@ type hub []portlist
 var thehub = newHub()
 
 func (c cli) send(m mes) {
+	// TODO test done
 	select {
 	case c.mc <- m:
 		log.Printf("INFO (cli) client %v broadcasted %v", c.mc, m)
@@ -128,14 +129,6 @@ func (p port) broadcast(m mes) {
 	//
 	// Aliás, o que foi discutido nesse comentário é 100% relevante pra
 	// seção de desenvolvimento do TCC.
-
-	// TODO: what if the client channel closed already?
-	// this will result in a goroutine leak
-	// how to avoid it?
-	// probably instad of c<-m
-	// we need a select that has also a "done" channel
-	// so when the done channel closes the goroutine stops
-	// which by its turn would require close to be properly sinchronized wrt the current code..
 
 	for c := range p {
 		go c.send(m)
