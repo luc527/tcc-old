@@ -12,20 +12,14 @@ type mtype byte // message type
 
 const (
 	// types of incoming messages
-	mExit  = mtype(0b000)
-	mEnter = mtype(0b001)
-	mSend  = mtype(0b011)
+	mExit  = mtype(0x01)
+	mEnter = mtype(0x02)
+	mSend  = mtype(0x03)
 
 	// types of outgoing messages
-	mRecv = mtype(0b010)
+	mRecv = mtype(0x04)
 	mSig  = mtype(0xFF)
 )
-
-// instead of 2 bytes for a signal,
-// could've used just the first bit of the byte to show it's a signal
-// and the remaining 7 bits for the signal code
-
-// TODO: outgoing message and signal should include server timestamp (?)
 
 // It's only with the hub that you should interact directly outside of this
 // file. Never with a port or portlist.
@@ -41,8 +35,8 @@ const (
 	sOkEnter = sig(0x01)
 	sOkExit  = sig(0x02)
 	sOkSend  = sig(0x03)
-	sErrType = sig(0x80)
 	sErrSend = sig(0x83)
+	sErrType = sig(0x84)
 )
 
 type cli struct {
@@ -52,6 +46,7 @@ type cli struct {
 
 type port map[cli]zero
 
+// TODO replace with rw mutex
 type portlist struct {
 	mu    *sync.Mutex
 	ports map[uint32]port
@@ -59,7 +54,7 @@ type portlist struct {
 
 type hub []portlist
 
-var thehub = newHub()
+var thehub = newHub(runtime.NumCPU())
 
 func (c cli) send(m mes) {
 	// TODO test done
@@ -122,13 +117,10 @@ func (p port) broadcast(m mes) {
 	// goroutines do runtime.
 	//
 	// (É quase que nem criar uma pilha vs. fazer uma chamada recursiva...
-	// interessante a analogia...)
+	// interessante a analogia)
 	//
 	// Para os propósitos do TCC, talvez (2) seja mais interessante, porque
 	// coloca a responsabilidade no runtime.
-	//
-	// Aliás, o que foi discutido nesse comentário é 100% relevante pra
-	// seção de desenvolvimento do TCC.
 
 	for c := range p {
 		go c.send(m)
@@ -183,8 +175,8 @@ func (pl portlist) broadcast(portid uint32, m mes) bool {
 	return true
 }
 
-func newHub() hub {
-	h := make(hub, runtime.NumCPU())
+func newHub(n int) hub {
+	h := make(hub, n)
 	for i := range h {
 		h[i] = makePortlist()
 	}
